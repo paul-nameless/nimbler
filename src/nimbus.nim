@@ -88,22 +88,17 @@ proc processClient(self: App, conn: AsyncSocket) {.async.} =
   let ctx = Context(http_method: s[0], path: s[1], proto: s[2], headers: newHttpHeaders(), conn: conn)
 
   if ctx.proto != HTTP1_1:
-    echo ctx.proto, " protocol not supported"
     conn.close()
     return
 
-  echo "Headers:"
   while true:
     let line = await conn.recvLine(maxLength=MAX_LEN)
     if line == "\r\n":
-      echo "Headers end"
       break
     let (key, value) = parseHeader(line)
     ctx.headers[key] = value
 
   info(ctx)
-
-  # var resp: Response
 
   for prefix, handler in self.prefixHandlers:
     if ctx.path.startsWith(prefix):
@@ -159,9 +154,6 @@ proc redirect*(url: string): proc(ctx: Context): Future[void] =
 
 
 proc staticHandler(ctx: Context, dirPath, prefix: string) {.async.} =
-  echo ctx.path
-  echo "Dir path: ", dirPath
-  echo "prefix: ", prefix
   let path = ctx.path.replace(prefix, "")
   let fullPath = joinPath(dirPath, path)
 
@@ -169,24 +161,30 @@ proc staticHandler(ctx: Context, dirPath, prefix: string) {.async.} =
     await ctx.file(fullPath)
   elif dirExists(fullPath):
     var listOfFiles = ""
-    for node in walkPattern(joinPath(dirPath, path, "*")):
-      let filename = node.replace(dirPath, "")
-      listOfFiles.add(li(a(href=joinPath(prefix, filename), filename)))
+    for elem in walkPattern(joinPath(dirPath, path, "*")):
+      let filename = splitPath(elem).tail
+      listOfFiles.add(li(a(filename, href=joinPath(prefix, path, filename))))
     let page = html(
-      head(title(fullPath)),
-      body(ul(listOfFiles))
+      head(title(path)),
+      body(
+        h1("Directory listing for: " & path),
+        hr(),
+        ul(listOfFiles),
+        hr()
+      )
     )
     await ctx.html(page)
   else:
-    await ctx.text("Not found")
+    await ctx.text("File not found", status=404)
 
 
 proc addStatic*(self: App, prefix: string, dirPath: string) =
   if self.prefixHandlers.hasKey(prefix):
     error("prefix already exists")
     quit 1
-  self.prefixHandlers[prefix] = proc(ctx: Context): Future[void] =
-                                    staticHandler(ctx, dirPath, prefix)
+  self.prefixHandlers[prefix] =
+    proc(ctx: Context): Future[void] =
+      staticHandler(ctx, dirPath, prefix)
 
 
 proc decodeQuery*(queries: string): TableRef[string, string] =
@@ -196,8 +194,3 @@ proc decodeQuery*(queries: string): TableRef[string, string] =
     if keyVal.len < 2:
       continue
     result[keyVal[0]] = keyVal[1]
-
-# when isMainModule:
-#   asyncCheck run()
-#   info("Server started...")
-#   runForever()
