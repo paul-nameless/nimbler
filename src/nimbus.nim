@@ -1,5 +1,4 @@
-import asyncnet, asyncdispatch, strutils, httpcore, tables, json, sequtils
-import logging
+import asyncnet, asyncdispatch, strutils, httpcore, tables, sequtils, logging, json, os, htmlgen
 
 
 var logger = newConsoleLogger(fmtStr="[$time] - $levelname: ")
@@ -11,52 +10,79 @@ const HTTP1_1 = "HTTP/1.1"
 var clients {.threadvar.}: seq[AsyncSocket]
 
 
-type Context = object
-  http_method: string
-  path: string
-  proto: string
-  headers: HttpHeaders
-  body: string
-  conn: AsyncSocket
+type Context* = object
+  http_method*: string
+  path*: string
+  proto*: string
+  headers*: HttpHeaders
+  body*: string
+  conn*: AsyncSocket
+  query*: TableRef[string, string]
+  form*: TableRef[string, string]
+  # json*: TableRef[string, string]
+  # app*: App
 
 
-type Response = object
-  status: int
-  headers: HttpHeaders
-  body: string
+proc getPeer*(self: Context): (string, Port) = self.conn.getPeerAddr()
 
-# declaration
-proc textResp(text: string = "", status: int = 200, headers: HttpHeaders = newHttpHeaders()): Response
 
-type Handler = object
-  http_method: string
-  fun: proc(ctx: Context): Future[Response]
+# proc set*(self: Context, key, value: string) = discard
+# proc get*(self: Context, key: string): string = discard
 
-var handlers = initTable[string, Handler]()
+
+proc send*(self: Context, body: string = "", status: int = 200, headers: HttpHeaders = nil) {.async.} =
+  await self.conn.send(self.proto & " " & $HttpCode(status) & "\n")
+
+  let headers = if headers == nil: newHttpHeaders() else: headers
+
+  headers["Content-Length"] = $body.len
+
+  for key, value in headers:
+    let beautyKey = join(map(split(key, '-'), capitalizeAscii), "-")
+    await self.conn.send(beautyKey & ": " & value & "\n")
+
+  await self.conn.send("\n" & body)
+
+  # TODO: we should close at the end, when handling finished
+  self.conn.close()
+
+
+
+proc text*(self: Context, body: string = "", status: int = 200, headers: HttpHeaders = nil) {.async.} =
+  let headers = if headers == nil: newHttpHeaders() else: headers
+  headers["content-type"] = "text/plain"
+  await self.send(body, status, headers)
+
+
+proc file*(self: Context, filePath: string = "", status: int = 200, headers: HttpHeaders = nil) {.async.} =
+  let headers = if headers == nil: newHttpHeaders() else: headers
+  headers["content-type"] = "application/octet-stream"
+  let body = readFile(filePath)
+  await self.send(body, status, headers)
+
+
+proc html*(self: Context, body: string = "", status: int = 200, headers: HttpHeaders = nil) {.async.} =
+  let headers = if headers == nil: newHttpHeaders() else: headers
+  headers["content-type"] = "text/html"
+  await self.send(body, status, headers)
+
+
+proc json*(self: Context, body: JsonNode, status: int = 200, headers: HttpHeaders = nil) {.async.} =
+  let headers = if headers == nil: newHttpHeaders() else: headers
+  headers["content-type"] = "application/json"
+  await self.send($body, status, headers)
 
 
 proc parseProto(line: string): seq[string] =
   return split(line, ' ')
 
 
+type App = object
+  handlers: TableRef[string, TableRef[string, proc(ctx: Context): Future[void]]]
+  prefixHandlers: TableRef[string, proc(ctx: Context): Future[void]]
 
 
-proc reply(ctx: Context, resp: Response) {.async.} =
-  await ctx.conn.send(ctx.proto & " " & $HttpCode(resp.status) & "\n")
-  resp.headers["Content-Length"] = $resp.body.len
-
-  for key, value in resp.headers:
-    echo "Key: ", key
-    let beautyKey = join(map(split(key, '-'), capitalizeAscii), "-")
-    await ctx.conn.send(beautyKey & ": " & value & "\n")
-
-  echo resp
-  await ctx.conn.send("\n" & resp.body)
-
-  ctx.conn.close()
-
-
-proc processClient(conn: AsyncSocket) {.async.} =
+proc processClient(self: App, conn: AsyncSocket) {.async.} =
   let line = await conn.recvLine(maxLength=MAX_LEN)
   let s = parseProto(line)
   let ctx = Context(http_method: s[0], path: s[1], proto: s[2], headers: newHttpHeaders(), conn: conn)
@@ -77,24 +103,25 @@ proc processClient(conn: AsyncSocket) {.async.} =
 
   info(ctx)
 
-  var resp: Response
+  # var resp: Response
 
-  if not handlers.hasKey(ctx.path):
-    await reply(ctx, textResp(status=404))
+  for prefix, handler in self.prefixHandlers:
+    if ctx.path.startsWith(prefix):
+      await handler(ctx)
+      return
+
+  if not self.handlers.hasKey(ctx.path):
+    await ctx.text(status=404)
     return
 
-  let handler = handlers[ctx.path]
-
-  if handler.http_method != ctx.http_method:
-    await reply(ctx, textResp(status=405))
+  if not self.handlers[ctx.path].hasKey(ctx.http_method):
+    await ctx.text(status=405)
     return
 
-  resp = await handler.fun(ctx)
-  await reply(ctx, resp)
-  return
+  await self.handlers[ctx.path][ctx.http_method](ctx)
 
 
-proc run() {.async.} =
+proc run*(self: App) {.async.} =
   clients = @[]
   var server = newAsyncSocket()
   server.setSockOpt(OptReuseAddr, true)
@@ -102,59 +129,75 @@ proc run() {.async.} =
   server.listen()
 
   while true:
-    let ctx = await server.accept()
-    clients.add ctx
+    let conn = await server.accept()
+    clients.add conn
 
-    asyncCheck processClient(ctx)
-
-
-proc htmlResp(html: string = "", status: int = 200, headers: HttpHeaders = newHttpHeaders()): Response =
-  headers["content-type"] = "text/html"
-  Response(status: status, body: html, headers: headers)
+    asyncCheck self.processClient(conn)
 
 
-proc jsonResp(json: JsonNode, status: int = 200, headers: HttpHeaders = newHttpHeaders()): Response =
-  headers["content-type"] = "application/json"
-  Response(status: status, body: $json, headers: headers)
+proc addHandler*(self: App, http_method: string, path: string, fun: proc(ctx: Context): Future[void]) =
+  if not self.handlers.hasKey(path):
+    self.handlers[path] = newTable[string, proc(ctx: Context): Future[void]]()
 
-
-proc textResp(text: string = "", status: int = 200, headers: HttpHeaders = newHttpHeaders()): Response =
-  headers["content-type"] = "text/plain"
-  Response(status: status, body: text, headers: headers)
-
-proc ping(ctx: Context): Future[Response] {.async.} =
-  return textResp("pong")
-
-
-proc getIp(ctx: Context): Future[Response] {.async.} =
-  let ip = ctx.conn.getPeerAddr()[0]
-  # return jsonResp(%* {"ip": $ip})
-  return textResp($ip)
-
-
-handlers["/ping"] = Handler(http_method: "GET", fun: ping)
-handlers["/ip"] = Handler(http_method: "GET", fun: getIp)
+  self.handlers[path][http_method] = fun
 
 
 
-type Server = object
-  ip: string
-  port: int
-  handlers: TableRef[string, Handler]
-
-proc run*(self: Server)
-
-proc addHandler*(self: Server, http_method: string, path: string, fun: proc(ctx: Context): Future[Response]) =
-  self.handlers[path] = Handler(http_method: "GET", fun: fun)
-
-proc get*(self: Server, path: string, fun: proc(ctx: Context): Future[Response]) =
+proc get*(self: App, path: string, fun: proc(ctx: Context): Future[void]) =
   self.addHandler("GET", path, fun)
 
-proc newServer*(ip: string = "127.0.0.1", port: int = 5555): Server =
-  return Server(ip: ip, port: port, handlers: newTable[string, Handler]())
+proc newApp*(): App =
+  return App(
+    handlers: newTable[string, TableRef[string, proc(ctx: Context): Future[void]]](),
+    prefixHandlers: newTable[string, proc(ctx: Context): Future[void]]()
+  )
 
 
-when isMainModule:
-  asyncCheck run()
-  info("Server started...")
-  runForever()
+proc redirect*(url: string): proc(ctx: Context): Future[void] =
+    return proc(ctx: Context): Future[void] =
+               ctx.send(status=303, headers=newHttpHeaders({"Location": url}))
+
+
+proc staticHandler(ctx: Context, dirPath, prefix: string) {.async.} =
+  echo ctx.path
+  echo "Dir path: ", dirPath
+  echo "prefix: ", prefix
+  let path = ctx.path.replace(prefix, "")
+  let fullPath = joinPath(dirPath, path)
+
+  if fileExists(fullPath):
+    await ctx.file(fullPath)
+  elif dirExists(fullPath):
+    var listOfFiles = ""
+    for node in walkPattern(joinPath(dirPath, path, "*")):
+      let filename = node.replace(dirPath, "")
+      listOfFiles.add(li(a(href=joinPath(prefix, filename), filename)))
+    let page = html(
+      head(title(fullPath)),
+      body(ul(listOfFiles))
+    )
+    await ctx.html(page)
+  else:
+    await ctx.text("Not found")
+
+
+proc addStatic*(self: App, prefix: string, dirPath: string) =
+  if self.prefixHandlers.hasKey(prefix):
+    error("prefix already exists")
+    quit 1
+  self.prefixHandlers[prefix] = proc(ctx: Context): Future[void] =
+                                    staticHandler(ctx, dirPath, prefix)
+
+
+proc decodeQuery*(queries: string): TableRef[string, string] =
+  result = newTable[string, string]()
+  for query in queries.split("&"):
+    let keyVal = query.split("=", 1)
+    if keyVal.len < 2:
+      continue
+    result[keyVal[0]] = keyVal[1]
+
+# when isMainModule:
+#   asyncCheck run()
+#   info("Server started...")
+#   runForever()
