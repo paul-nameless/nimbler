@@ -1,7 +1,7 @@
 import
   asyncdispatch,
   httpClient,
-  nimbus,
+  nimbler,
   unittest
 
 

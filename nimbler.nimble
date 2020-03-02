@@ -6,6 +6,7 @@ description   = "A new awesome nimble package"
 license       = "MIT"
 srcDir        = "src"
 
+skipFiles = @["run.nim"]
 
 # Dependencies
 
