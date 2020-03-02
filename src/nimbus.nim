@@ -1,4 +1,14 @@
-import asyncnet, asyncdispatch, strutils, httpcore, tables, sequtils, logging, json, os, htmlgen
+import
+  asyncdispatch,
+  asyncnet,
+  httpcore,
+  json,
+  logging,
+  os,
+  sequtils,
+  strutils,
+  tables
+from htmlgen import nil
 
 
 var logger = newConsoleLogger(fmtStr="[$time] - $levelname: ")
@@ -20,7 +30,6 @@ type Context* = object
   query*: TableRef[string, string]
   form*: TableRef[string, string]
   # json*: TableRef[string, string]
-  # app*: App
 
 
 proc getPeer*(self: Context): (string, Port) = self.conn.getPeerAddr()
@@ -78,8 +87,22 @@ proc parseProto(line: string): seq[string] =
 
 
 type App = object
-  handlers: TableRef[string, TableRef[string, proc(ctx: Context): Future[void]]]
-  prefixHandlers: TableRef[string, proc(ctx: Context): Future[void]]
+  is_stopped: bool
+  server*: AsyncSocket
+  handlers: TableRef[
+    string,
+    TableRef[string, proc(ctx: Context): Future[void]]
+  ]
+  prefixHandlers: TableRef[
+    string, proc(ctx: Context): Future[void]
+  ]
+
+proc newApp*(): App =
+  return App(
+    server: newAsyncSocket(),
+    handlers: newTable[string, TableRef[string, proc(ctx: Context): Future[void]]](),
+    prefixHandlers: newTable[string, proc(ctx: Context): Future[void]]()
+  )
 
 
 proc processClient(self: App, conn: AsyncSocket) {.async.} =
@@ -116,18 +139,26 @@ proc processClient(self: App, conn: AsyncSocket) {.async.} =
   await self.handlers[ctx.path][ctx.http_method](ctx)
 
 
+var is_stopped = false
+
 proc run*(self: App) {.async.} =
   clients = @[]
-  var server = newAsyncSocket()
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(5555), address="127.0.0.1")
-  server.listen()
+  self.server.setSockOpt(OptReuseAddr, true)
+  self.server.bindAddr(Port(5555), address="127.0.0.1")
+  self.server.listen()
 
-  while true:
-    let conn = await server.accept()
+  while not is_stopped:
+    echo "waiting for connection"
+    let conn = await self.server.accept()
     clients.add conn
+    echo "get conn"
 
     asyncCheck self.processClient(conn)
+
+
+proc stop*(app: App) =
+  is_stopped = true
+  # app.server.close()
 
 
 proc addHandler*(self: App, http_method: string, path: string, fun: proc(ctx: Context): Future[void]) =
@@ -141,36 +172,30 @@ proc addHandler*(self: App, http_method: string, path: string, fun: proc(ctx: Co
 proc get*(self: App, path: string, fun: proc(ctx: Context): Future[void]) =
   self.addHandler("GET", path, fun)
 
-proc newApp*(): App =
-  return App(
-    handlers: newTable[string, TableRef[string, proc(ctx: Context): Future[void]]](),
-    prefixHandlers: newTable[string, proc(ctx: Context): Future[void]]()
-  )
-
 
 proc redirect*(url: string): proc(ctx: Context): Future[void] =
     return proc(ctx: Context): Future[void] =
                ctx.send(status=303, headers=newHttpHeaders({"Location": url}))
 
 
-proc staticHandler(ctx: Context, dirPath, prefix: string) {.async.} =
+proc staticHandler(ctx: Context, prefix, dirPath: string, showDirs: bool = false) {.async.} =
   let path = ctx.path.replace(prefix, "")
   let fullPath = joinPath(dirPath, path)
 
   if fileExists(fullPath):
     await ctx.file(fullPath)
-  elif dirExists(fullPath):
+  elif showDirs and dirExists(fullPath):
     var listOfFiles = ""
     for elem in walkPattern(joinPath(dirPath, path, "*")):
       let filename = splitPath(elem).tail
-      listOfFiles.add(li(a(filename, href=joinPath(prefix, path, filename))))
-    let page = html(
-      head(title(path)),
-      body(
-        h1("Directory listing for: " & path),
-        hr(),
-        ul(listOfFiles),
-        hr()
+      listOfFiles.add(htmlgen.li(htmlgen.a(filename, href=joinPath(prefix, path, filename))))
+    let page = htmlgen.html(
+      htmlgen.head(htmlgen.title(path)),
+      htmlgen.body(
+        htmlgen.h1("Directory listing for: " & path),
+        htmlgen.hr(),
+        htmlgen.ul(listOfFiles),
+        htmlgen.hr()
       )
     )
     await ctx.html(page)
@@ -178,13 +203,13 @@ proc staticHandler(ctx: Context, dirPath, prefix: string) {.async.} =
     await ctx.text("File not found", status=404)
 
 
-proc addStatic*(self: App, prefix: string, dirPath: string) =
+proc addStatic*(self: App, prefix: string, dirPath: string, showDirs: bool = false) =
   if self.prefixHandlers.hasKey(prefix):
     error("prefix already exists")
     quit 1
   self.prefixHandlers[prefix] =
     proc(ctx: Context): Future[void] =
-      staticHandler(ctx, dirPath, prefix)
+      staticHandler(ctx, dirPath, prefix, showDirs)
 
 
 proc decodeQuery*(queries: string): TableRef[string, string] =
